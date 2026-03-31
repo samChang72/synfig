@@ -2,6 +2,22 @@ set(INSTALL_DESTINATION "share/synfig/plugins/pixijs-exporter")
 set(PLUGIN_PIXIJS_EXPORTER_FILES
     pixijs-exporter.py
     settings.py
+    converters/__init__.py
+    converters/animation.py
+    converters/blend.py
+    converters/color.py
+    converters/filters.py
+    converters/gradient.py
+    converters/image.py
+    converters/interactive.py
+    converters/path.py
+    converters/shapes.py
+    converters/text.py
+    converters/transform.py
+    layers/__init__.py
+    layers/driver.py
+    runtime/__init__.py
+    runtime/tween.js
 )
 
 foreach(CURRENT_FILE ${PLUGIN_PIXIJS_EXPORTER_FILES})
