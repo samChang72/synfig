@@ -53,7 +53,7 @@ def gen_html(canvas_meta, pixi_js_code, has_animations=False):
 </head>
 <body>{tween_script}
 <script type="module">
-import {{ Application, Graphics, Container, FillGradient }} from '{pixi_settings.PIXI_CDN}';
+import {{ Application, WebGLRenderer, Graphics, Container, FillGradient, Sprite, Assets }} from '{pixi_settings.PIXI_CDN}';
 
 (async () => {{
   const app = new Application();
@@ -62,6 +62,7 @@ import {{ Application, Graphics, Container, FillGradient }} from '{pixi_settings
     height: {canvas_meta['height']},
     backgroundColor: {pixi_settings.DEFAULT_BG_COLOR},
     antialias: true,
+    renderer: WebGLRenderer,
   }});
   document.body.appendChild(app.canvas);
 
@@ -88,9 +89,10 @@ def main():
 
     canvas_meta = parse_canvas(root)
     ppu = calc_pixels_per_unit(canvas_meta['width'], canvas_meta['height'], canvas_meta['view_box'])
+    sif_dir = os.path.dirname(os.path.abspath(ns.infile))
     pixi_js_code, has_animations = gen_pixi_layers(
         root, canvas_meta['width'], canvas_meta['height'], ppu,
-        fps=canvas_meta['fps']
+        fps=canvas_meta['fps'], sif_dir=sif_dir
     )
     html = gen_html(canvas_meta, pixi_js_code, has_animations=has_animations)
 

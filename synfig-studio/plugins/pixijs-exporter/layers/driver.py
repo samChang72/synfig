@@ -9,10 +9,12 @@ from converters.color import parse_synfig_color
 from converters.transform import synfig_to_pixi_coords
 from converters.shapes import gen_circle_js, gen_rectangle_js, gen_star_js, gen_solid_rect_js
 from converters.animation import waypoints_to_tween_js, gen_tween_setup_js, gen_tween_play_js
+from converters.image import gen_image_js
 
 SHAPE_SOLID = {"region", "polygon", "advanced_outline", "outline", "circle",
                "rectangle", "filled_rectangle", "star"}
 SOLID = {"solid_color", "SolidColor"}
+IMAGE = {"import"}
 GROUP = {"group", "switch"}
 
 
@@ -49,6 +51,25 @@ def _parse_color(layer_el):
         if color_el is not None:
             return parse_synfig_color(color_el)
     return "0xffffff", 1.0
+
+def _parse_vector(layer_el, name, canvas_w, canvas_h, ppu):
+    """Parse a named vector param and convert to PixiJS coords."""
+    param = _get_param(layer_el, name)
+    if param is not None:
+        vec = param.find("vector")
+        if vec is not None:
+            sx = float(vec.findtext("x", "0"))
+            sy = float(vec.findtext("y", "0"))
+            return synfig_to_pixi_coords(sx, sy, canvas_w, canvas_h, ppu)
+    return None, None
+
+def _parse_string(layer_el, name, default=""):
+    param = _get_param(layer_el, name)
+    if param is not None:
+        str_el = param.find("string")
+        if str_el is not None and str_el.text:
+            return str_el.text.strip()
+    return default
 
 def _parse_real(layer_el, name, default=0.0):
     param = _get_param(layer_el, name)
@@ -130,7 +151,7 @@ def _build_origin_tweens(name, layer_el, fps, canvas_w, canvas_h, ppu):
     parts.append(gen_tween_play_js(name, loop=True))
     return parts
 
-def gen_pixi_layers(root, canvas_w, canvas_h, ppu, fps=24, _namer=None):
+def gen_pixi_layers(root, canvas_w, canvas_h, ppu, fps=24, _namer=None, sif_dir=None):
     namer = _namer if _namer is not None else _NameGenerator()
     fps = max(fps, 1)
     js_parts = []
@@ -185,6 +206,21 @@ def gen_pixi_layers(root, canvas_w, canvas_h, ppu, fps=24, _namer=None):
                 tween_parts.extend(origin_tweens)
                 has_animations = True
 
+        elif layer_type in IMAGE:
+            name = namer.next("img")
+            filename = _parse_string(layer_el, "filename")
+            if filename:
+                image_path = filename if os.path.isabs(filename) else os.path.join(sif_dir or "", filename)
+                if os.path.isfile(image_path):
+                    tl_x, tl_y = _parse_vector(layer_el, "tl", canvas_w, canvas_h, ppu)
+                    br_x, br_y = _parse_vector(layer_el, "br", canvas_w, canvas_h, ppu)
+                    if tl_x is not None and br_x is not None:
+                        w = abs(br_x - tl_x)
+                        h = abs(br_y - tl_y)
+                        x = min(tl_x, br_x)
+                        y = min(tl_y, br_y)
+                        js_parts.append(gen_image_js(name, image_path, x, y, w, h, project_dir=sif_dir))
+
         elif layer_type in SOLID:
             fill_hex, alpha = _parse_color(layer_el)
             js_parts.append(gen_solid_rect_js(namer.next("solid"), canvas_w, canvas_h, fill_hex, alpha * amount))
@@ -193,15 +229,23 @@ def gen_pixi_layers(root, canvas_w, canvas_h, ppu, fps=24, _namer=None):
             name = namer.next("group")
             js_parts.append(f"  const {name} = new Container();\n")
             js_parts.append(f"  app.stage.addChild({name});\n")
+            # Find canvas: either direct <canvas> child or <param name="canvas"><canvas>
+            canvases = []
             for child in layer_el:
                 if child.tag == "canvas":
-                    child_code, child_has_anim = gen_pixi_layers(
-                        child, canvas_w, canvas_h, ppu, fps, _namer=namer
-                    )
-                    child_code = child_code.replace("app.stage.addChild", f"{name}.addChild")
-                    js_parts.append(child_code)
-                    if child_has_anim:
-                        has_animations = True
+                    canvases.append(child)
+                elif child.tag == "param" and child.attrib.get("name") == "canvas":
+                    canvas_el = child.find("canvas")
+                    if canvas_el is not None:
+                        canvases.append(canvas_el)
+            for canvas_el in canvases:
+                child_code, child_has_anim = gen_pixi_layers(
+                    canvas_el, canvas_w, canvas_h, ppu, fps, _namer=namer, sif_dir=sif_dir
+                )
+                child_code = child_code.replace("app.stage.addChild", f"{name}.addChild")
+                js_parts.append(child_code)
+                if child_has_anim:
+                    has_animations = True
 
     if not js_parts and not tween_parts:
         return ("  // No supported layers found\n", False)

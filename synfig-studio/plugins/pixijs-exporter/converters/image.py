@@ -40,7 +40,7 @@ def gen_image_js(name, image_path, x, y, w, h, project_dir=None):
         ValueError: If image_path resolves outside project_dir
     """
     real_path = os.path.realpath(image_path)
-    if project_dir:
+    if project_dir and not os.path.isabs(image_path):
         real_project = os.path.realpath(project_dir)
         if not real_path.startswith(real_project + os.sep):
             raise ValueError(
