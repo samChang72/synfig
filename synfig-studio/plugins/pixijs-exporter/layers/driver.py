@@ -1,0 +1,258 @@
+"""
+driver.py — Main layer dispatch: reads Synfig XML layers and generates PixiJS JS code.
+"""
+import os
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
+from converters.color import parse_synfig_color
+from converters.transform import synfig_to_pixi_coords
+from converters.shapes import gen_circle_js, gen_rectangle_js, gen_star_js, gen_solid_rect_js
+from converters.animation import waypoints_to_tween_js, gen_tween_setup_js, gen_tween_play_js
+from converters.image import gen_image_js
+
+SHAPE_SOLID = {"region", "polygon", "advanced_outline", "outline", "circle",
+               "rectangle", "filled_rectangle", "star"}
+SOLID = {"solid_color", "SolidColor"}
+IMAGE = {"import"}
+GROUP = {"group", "switch"}
+
+
+class _NameGenerator:
+    """Thread-safe, non-global name counter for generated JS variables."""
+
+    def __init__(self):
+        self._counter = 0
+
+    def next(self, prefix):
+        self._counter += 1
+        return f"{prefix}_{self._counter}"
+
+def _get_param(layer_el, name):
+    for p in layer_el:
+        if p.tag == "param" and p.attrib.get("name") == name:
+            return p
+    return None
+
+def _parse_origin(layer_el, canvas_w, canvas_h, ppu):
+    param = _get_param(layer_el, "origin")
+    if param is not None:
+        vec = param.find("vector")
+        if vec is not None:
+            sx = float(vec.findtext("x", "0"))
+            sy = float(vec.findtext("y", "0"))
+            return synfig_to_pixi_coords(sx, sy, canvas_w, canvas_h, ppu)
+    return canvas_w / 2.0, canvas_h / 2.0
+
+def _parse_color(layer_el):
+    param = _get_param(layer_el, "color")
+    if param is not None:
+        color_el = param.find("color")
+        if color_el is not None:
+            return parse_synfig_color(color_el)
+    return "0xffffff", 1.0
+
+def _parse_vector(layer_el, name, canvas_w, canvas_h, ppu):
+    """Parse a named vector param and convert to PixiJS coords."""
+    param = _get_param(layer_el, name)
+    if param is not None:
+        vec = param.find("vector")
+        if vec is not None:
+            sx = float(vec.findtext("x", "0"))
+            sy = float(vec.findtext("y", "0"))
+            return synfig_to_pixi_coords(sx, sy, canvas_w, canvas_h, ppu)
+    return None, None
+
+def _parse_string(layer_el, name, default=""):
+    param = _get_param(layer_el, name)
+    if param is not None:
+        str_el = param.find("string")
+        if str_el is not None and str_el.text:
+            return str_el.text.strip()
+    return default
+
+def _parse_real(layer_el, name, default=0.0):
+    param = _get_param(layer_el, name)
+    if param is not None:
+        real_el = param.find("real")
+        if real_el is not None:
+            return float(real_el.attrib.get("value", str(default)))
+    return default
+
+def _parse_time(time_str, fps):
+    """Parse a Synfig time string (e.g. '0s', '1.5s', or frame number '12')."""
+    if time_str.endswith("s"):
+        return float(time_str[:-1])
+    return float(time_str) / fps
+
+def _parse_waypoint_base(wp, fps):
+    """Extract common waypoint attributes (time, interpolation, TCB)."""
+    return {
+        "time": _parse_time(wp.attrib.get("time", "0s"), fps),
+        "before": wp.attrib.get("before", "linear"),
+        "after": wp.attrib.get("after", "linear"),
+        "tension": float(wp.attrib.get("tension", "0")),
+        "continuity": float(wp.attrib.get("continuity", "0")),
+        "bias": float(wp.attrib.get("bias", "0")),
+    }
+
+# Used by future tasks for animating scalar params (radius, amount, etc.)
+def _parse_animated_real(param_el, fps):
+    """Extract waypoints from an <animated> element inside a param."""
+    if param_el is None:
+        return None
+    animated = param_el.find("animated")
+    if animated is None:
+        return None
+    waypoints = []
+    for wp in animated.findall("waypoint"):
+        real_el = wp.find("real")
+        if real_el is None:
+            continue
+        value = float(real_el.attrib.get("value", "0"))
+        waypoints.append({**_parse_waypoint_base(wp, fps), "value": value})
+    return waypoints if waypoints else None
+
+def _parse_animated_origin(param_el, fps, canvas_w, canvas_h, ppu):
+    """Extract x/y waypoints from animated origin (vector type)."""
+    if param_el is None:
+        return None, None
+    animated = param_el.find("animated")
+    if animated is None:
+        return None, None
+    x_waypoints = []
+    y_waypoints = []
+    for wp in animated.findall("waypoint"):
+        vec = wp.find("vector")
+        if vec is None:
+            continue
+        sx = float(vec.findtext("x", "0"))
+        sy = float(vec.findtext("y", "0"))
+        px, py = synfig_to_pixi_coords(sx, sy, canvas_w, canvas_h, ppu)
+
+        base = _parse_waypoint_base(wp, fps)
+        x_waypoints.append({**base, "value": px})
+        y_waypoints.append({**base, "value": py})
+
+    return (x_waypoints if x_waypoints else None,
+            y_waypoints if y_waypoints else None)
+
+def _build_origin_tweens(name, layer_el, fps, canvas_w, canvas_h, ppu):
+    """Build tween JS strings for animated origin. Returns a list (empty if no animation)."""
+    origin_param = _get_param(layer_el, "origin")
+    x_wps, y_wps = _parse_animated_origin(origin_param, fps, canvas_w, canvas_h, ppu)
+    if not x_wps and not y_wps:
+        return []
+    parts = [gen_tween_setup_js(name)]
+    if x_wps:
+        parts.append(waypoints_to_tween_js(name, "x", x_wps))
+    if y_wps:
+        parts.append(waypoints_to_tween_js(name, "y", y_wps))
+    parts.append(gen_tween_play_js(name, loop=True))
+    return parts
+
+def gen_pixi_layers(root, canvas_w, canvas_h, ppu, fps=24, _namer=None, sif_dir=None):
+    namer = _namer if _namer is not None else _NameGenerator()
+    fps = max(fps, 1)
+    js_parts = []
+    tween_parts = []
+    has_animations = False
+    layers = [el for el in root if el.tag == "layer"]
+
+    for layer_el in reversed(layers):
+        layer_type = layer_el.attrib.get("type", "")
+        active = layer_el.attrib.get("active", "true") == "true"
+        if not active:
+            continue
+        amount = _parse_real(layer_el, "amount", 1.0)
+        if amount <= 0:
+            continue
+
+        if layer_type in ("circle", "simple_circle"):
+            name = namer.next("circle")
+            cx, cy = _parse_origin(layer_el, canvas_w, canvas_h, ppu)
+            radius = _parse_real(layer_el, "radius", 1.0) * ppu
+            fill_hex, alpha = _parse_color(layer_el)
+            js_parts.append(gen_circle_js(name, cx, cy, radius, fill_hex, alpha * amount))
+
+            origin_tweens = _build_origin_tweens(name, layer_el, fps, canvas_w, canvas_h, ppu)
+            if origin_tweens:
+                tween_parts.extend(origin_tweens)
+                has_animations = True
+
+        elif layer_type in ("rectangle", "filled_rectangle"):
+            name = namer.next("rect")
+            cx, cy = _parse_origin(layer_el, canvas_w, canvas_h, ppu)
+            fill_hex, alpha = _parse_color(layer_el)
+            expand = _parse_real(layer_el, "expand", 1.0) * ppu * 2
+            js_parts.append(gen_rectangle_js(name, cx - expand/2, cy - expand/2, expand, expand, fill_hex, alpha * amount))
+
+            origin_tweens = _build_origin_tweens(name, layer_el, fps, canvas_w, canvas_h, ppu)
+            if origin_tweens:
+                tween_parts.extend(origin_tweens)
+                has_animations = True
+
+        elif layer_type == "star":
+            name = namer.next("star")
+            cx, cy = _parse_origin(layer_el, canvas_w, canvas_h, ppu)
+            fill_hex, alpha = _parse_color(layer_el)
+            r1 = _parse_real(layer_el, "radius1", 1.0) * ppu
+            r2 = _parse_real(layer_el, "radius2", 0.5) * ppu
+            points = int(_parse_real(layer_el, "points", 5))
+            js_parts.append(gen_star_js(name, cx, cy, points, r1, r2, fill_hex, alpha * amount))
+
+            origin_tweens = _build_origin_tweens(name, layer_el, fps, canvas_w, canvas_h, ppu)
+            if origin_tweens:
+                tween_parts.extend(origin_tweens)
+                has_animations = True
+
+        elif layer_type in IMAGE:
+            name = namer.next("img")
+            filename = _parse_string(layer_el, "filename")
+            if filename:
+                image_path = filename if os.path.isabs(filename) else os.path.join(sif_dir or "", filename)
+                if os.path.isfile(image_path):
+                    tl_x, tl_y = _parse_vector(layer_el, "tl", canvas_w, canvas_h, ppu)
+                    br_x, br_y = _parse_vector(layer_el, "br", canvas_w, canvas_h, ppu)
+                    if tl_x is not None and br_x is not None:
+                        w = abs(br_x - tl_x)
+                        h = abs(br_y - tl_y)
+                        x = min(tl_x, br_x)
+                        y = min(tl_y, br_y)
+                        js_parts.append(gen_image_js(name, image_path, x, y, w, h, project_dir=sif_dir))
+
+        elif layer_type in SOLID:
+            fill_hex, alpha = _parse_color(layer_el)
+            js_parts.append(gen_solid_rect_js(namer.next("solid"), canvas_w, canvas_h, fill_hex, alpha * amount))
+
+        elif layer_type in GROUP:
+            name = namer.next("group")
+            js_parts.append(f"  const {name} = new Container();\n")
+            js_parts.append(f"  app.stage.addChild({name});\n")
+            # Find canvas: either direct <canvas> child or <param name="canvas"><canvas>
+            canvases = []
+            for child in layer_el:
+                if child.tag == "canvas":
+                    canvases.append(child)
+                elif child.tag == "param" and child.attrib.get("name") == "canvas":
+                    canvas_el = child.find("canvas")
+                    if canvas_el is not None:
+                        canvases.append(canvas_el)
+            for canvas_el in canvases:
+                child_code, child_has_anim = gen_pixi_layers(
+                    canvas_el, canvas_w, canvas_h, ppu, fps, _namer=namer, sif_dir=sif_dir
+                )
+                child_code = child_code.replace("app.stage.addChild", f"{name}.addChild")
+                js_parts.append(child_code)
+                if child_has_anim:
+                    has_animations = True
+
+    if not js_parts and not tween_parts:
+        return ("  // No supported layers found\n", False)
+
+    result = "".join(js_parts)
+    if tween_parts:
+        result += "\n  // Animation tweens\n"
+        result += "".join(tween_parts)
+        has_animations = True
+    return (result, has_animations)
